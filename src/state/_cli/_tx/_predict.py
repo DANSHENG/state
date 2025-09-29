@@ -41,6 +41,12 @@ def add_arguments_predict(parser: ap.ArgumentParser):
     )
 
     parser.add_argument(
+        "--split-batch",
+        action="store_true",
+        help="If set, compute metrics separately for each (cell type, batch) pair.",
+    )
+
+    parser.add_argument(
         "--shared-only",
         action="store_true",
         help=("If set, restrict predictions/evaluation to perturbations shared between train and test (train ∩ test)."),
@@ -67,7 +73,7 @@ def run_tx_predict(args: ap.ArgumentParser):
 
     # Cell-eval for metrics computation
     from cell_eval import MetricsEvaluator
-    from cell_eval.utils import split_anndata_on_celltype
+    from cell_eval.utils import build_celltype_split_specs
     from cell_load.data_modules import PerturbationDataModule
     from tqdm import tqdm
 
@@ -288,17 +294,70 @@ def run_tx_predict(args: ap.ArgumentParser):
             else:
                 all_celltypes.append(batch_preds["celltype_name"])
 
-            # Handle gem_group
-            if isinstance(batch_preds["batch"], list):
-                all_gem_groups.extend([str(x) for x in batch_preds["batch"]])
-            elif isinstance(batch_preds["batch"], torch.Tensor):
-                all_gem_groups.extend([str(x) for x in batch_preds["batch"].cpu().numpy()])
-            else:
-                all_gem_groups.append(str(batch_preds["batch"]))
+            batch_size = batch_preds["preds"].shape[0]
+
+            # Handle gem_group - prefer human-readable batch names when available
+            def normalize_batch_labels(values):
+                if values is None:
+                    return None
+                if isinstance(values, torch.Tensor):
+                    values = values.detach().cpu().numpy()
+                if isinstance(values, np.ndarray):
+                    if values.ndim == 2:
+                        if values.shape[0] != batch_size:
+                            return None
+                        if values.shape[1] == 1:
+                            flat = values.reshape(batch_size)
+                            return [str(x) for x in flat.tolist()]
+                        indices = values.argmax(axis=1)
+                        return [str(int(x)) for x in indices.tolist()]
+                    if values.ndim == 1:
+                        if values.shape[0] != batch_size:
+                            return None
+                        return [str(x) for x in values.tolist()]
+                    if values.ndim == 0:
+                        return [str(values.item())] * batch_size
+                    return None
+                if isinstance(values, (list, tuple)):
+                    if len(values) != batch_size:
+                        return None
+                    normalized = []
+                    for item in values:
+                        if isinstance(item, torch.Tensor):
+                            item = item.detach().cpu().numpy()
+                        if isinstance(item, np.ndarray):
+                            if item.ndim == 0:
+                                normalized.append(str(item.item()))
+                                continue
+                            if item.ndim == 1:
+                                if item.size == 1:
+                                    normalized.append(str(item.item()))
+                                elif np.count_nonzero(item) == 1:
+                                    normalized.append(str(int(item.argmax())))
+                                else:
+                                    normalized.append(str(item.tolist()))
+                                continue
+                        normalized.append(str(item))
+                    return normalized
+                return [str(values)] * batch_size
+
+            batch_name_candidates = (
+                batch.get("batch_name"),
+                batch_preds.get("batch_name"),
+                batch_preds.get("batch"),
+            )
+
+            batch_labels = None
+            for candidate in batch_name_candidates:
+                batch_labels = normalize_batch_labels(candidate)
+                if batch_labels is not None:
+                    break
+            if batch_labels is None:
+                batch_labels = ["None"] * batch_size
+            all_gem_groups.extend(batch_labels)
 
             batch_pred_np = batch_preds["preds"].cpu().numpy().astype(np.float32)
             batch_real_np = batch_preds["pert_cell_emb"].cpu().numpy().astype(np.float32)
-            batch_size = batch_pred_np.shape[0]
             final_preds[current_idx : current_idx + batch_size, :] = batch_pred_np
             final_reals[current_idx : current_idx + batch_size, :] = batch_real_np
             current_idx += batch_size
@@ -408,25 +467,41 @@ def run_tx_predict(args: ap.ArgumentParser):
 
         control_pert = data_module.get_control_pert()
 
-        ct_split_real = split_anndata_on_celltype(adata=adata_real, celltype_col=data_module.cell_type_key)
-        ct_split_pred = split_anndata_on_celltype(adata=adata_pred, celltype_col=data_module.cell_type_key)
+        batch_key = data_module.batch_col if args.split_batch else None
+        if args.split_batch:
+            if not batch_key:
+                raise ValueError("--split-batch requested but no batch column is configured on the data module.")
+            logger.info(
+                "Splitting evaluation by cell type and batch column '%s'", batch_key
+            )
 
-        assert len(ct_split_real) == len(ct_split_pred), (
-            f"Number of celltypes in real and pred anndata must match: {len(ct_split_real)} != {len(ct_split_pred)}"
+        split_specs = build_celltype_split_specs(
+            real=adata_real,
+            pred=adata_pred,
+            celltype_col=data_module.cell_type_key,
+            batch_key=batch_key,
         )
 
         pdex_kwargs = dict(exp_post_agg=True, is_log1p=True)
-        for ct in ct_split_real.keys():
-            real_ct = ct_split_real[ct]
-            pred_ct = ct_split_pred[ct]
+        for split in split_specs:
+            batch_suffix = (
+                f", batch={split.batch}"
+                if split.batch is not None and not pd.isna(split.batch)
+                else ""
+            )
+            logger.info(
+                "Evaluating metrics for celltype=%s%s",
+                split.celltype,
+                batch_suffix,
+            )
 
             evaluator = MetricsEvaluator(
-                adata_pred=pred_ct,
-                adata_real=real_ct,
+                adata_pred=split.pred,
+                adata_real=split.real,
                 control_pert=control_pert,
                 pert_col=data_module.pert_col,
                 outdir=results_dir,
-                prefix=ct,
+                prefix=split.label,
                 pdex_kwargs=pdex_kwargs,
                 batch_size=2048,
             )
