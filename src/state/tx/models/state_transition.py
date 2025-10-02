@@ -162,6 +162,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         self.distributional_loss = distributional_loss
         self.gene_dim = gene_dim
+        self.mmd_num_chunks = max(int(kwargs.get("mmd_num_chunks", 1)), 1)
+        self.randomize_mmd_chunks = bool(kwargs.get("randomize_mmd_chunks", False))
 
         # Build the distributional loss from geomloss
         blur = kwargs.get("blur", 0.05)
@@ -529,6 +531,24 @@ class StateTransitionPerturbationModel(PerturbationModel):
         else:
             return output
 
+    def _compute_distribution_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Apply the primary distributional loss, optionally chunking feature dimensions for SamplesLoss."""
+
+        if isinstance(self.loss_fn, SamplesLoss) and self.mmd_num_chunks > 1:
+            feature_dim = pred.shape[-1]
+            num_chunks = min(self.mmd_num_chunks, feature_dim)
+            if num_chunks > 1 and feature_dim > 0:
+                if self.randomize_mmd_chunks and self.training:
+                    perm = torch.randperm(feature_dim, device=pred.device)
+                    pred = pred.index_select(-1, perm)
+                    target = target.index_select(-1, perm)
+                pred_chunks = torch.chunk(pred, num_chunks, dim=-1)
+                target_chunks = torch.chunk(target, num_chunks, dim=-1)
+                chunk_losses = [self.loss_fn(p_chunk, t_chunk) for p_chunk, t_chunk in zip(pred_chunks, target_chunks)]
+                return torch.stack(chunk_losses, dim=0).nanmean(dim=0)
+
+        return self.loss_fn(pred, target)
+
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int, padded=True) -> torch.Tensor:
         """Training step logic for both main model and decoder."""
         # Get model predictions (in latent space)
@@ -547,7 +567,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             pred = pred.reshape(1, -1, self.output_dim)
             target = target.reshape(1, -1, self.output_dim)
 
-        per_set_main_losses = self.loss_fn(pred, target)
+        per_set_main_losses = self._compute_distribution_loss(pred, target)
         main_loss = torch.nanmean(per_set_main_losses)
         self.log("train_loss", main_loss)
 
@@ -637,7 +657,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 else:
                     gene_targets = gene_targets.reshape(1, -1, self.gene_decoder.gene_dim())
 
-                decoder_loss = self.loss_fn(pert_cell_counts_preds, gene_targets).mean()
+                decoder_per_set = self._compute_distribution_loss(pert_cell_counts_preds, gene_targets)
+                decoder_loss = decoder_per_set.mean()
 
             # Log decoder loss
             self.log("decoder_loss", decoder_loss)
@@ -685,7 +706,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         target = batch["pert_cell_emb"]
         target = target.reshape(-1, self.cell_sentence_len, self.output_dim)
 
-        per_set_main_losses = self.loss_fn(pred, target)
+        per_set_main_losses = self._compute_distribution_loss(pred, target)
         loss = torch.nanmean(per_set_main_losses)
         self.log("val_loss", loss)
 
@@ -713,7 +734,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
                     -1, self.cell_sentence_len, self.gene_decoder.gene_dim()
                 )
                 gene_targets = gene_targets.reshape(-1, self.cell_sentence_len, self.gene_decoder.gene_dim())
-                decoder_loss = self.loss_fn(pert_cell_counts_preds, gene_targets).mean()
+                decoder_per_set = self._compute_distribution_loss(pert_cell_counts_preds, gene_targets)
+                decoder_loss = decoder_per_set.mean()
 
             # Log the validation metric
             self.log("val/decoder_loss", decoder_loss)
@@ -743,7 +765,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         target = batch["pert_cell_emb"]
         pred = pred.reshape(1, -1, self.output_dim)
         target = target.reshape(1, -1, self.output_dim)
-        per_set_main_losses = self.loss_fn(pred, target)
+        per_set_main_losses = self._compute_distribution_loss(pred, target)
         loss = torch.nanmean(per_set_main_losses)
         self.log("test_loss", loss)
 
