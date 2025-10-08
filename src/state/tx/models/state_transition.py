@@ -97,6 +97,28 @@ class ConfidenceToken(nn.Module):
 
         return main_output, confidence_pred
 
+class HillGate(nn.Module):
+    """
+    Monotone, saturating gate w(d) for dose d that multiplies the residual.
+    For each hidden unit h:
+        w_h(d) = softplus(Emax_h) * (d/EC50_h)^{n_h} / (1 + (d/EC50_h)^{n_h})
+    The forward expects log10-dose with shape [B,S,1] (standardized is fine).
+    """
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.log_ec50 = nn.Parameter(torch.zeros(hidden_dim))   # EC50 = exp(log_ec50) > 0
+        self.emax     = nn.Parameter(torch.ones(hidden_dim))     # softplus(emax) > 0
+        self.hill     = nn.Parameter(torch.ones(hidden_dim))     # softplus(hill) > 0
+
+    def forward(self, log10_d: torch.Tensor) -> torch.Tensor:
+        # Convert log10-dose to linear space and broadcast to hidden dim
+        d = (10.0 ** log10_d).clamp_min(1e-12)                  # [B,S,1]
+        n    = F.softplus(self.hill).view(1, 1, -1)             # [1,1,H]
+        emax = F.softplus(self.emax).view(1, 1, -1)             # [1,1,H]
+        ec50 = self.log_ec50.exp().view(1, 1, -1)               # [1,1,H]
+        ratio_pow = (d / ec50).pow(n)                           # [B,S,H]
+        w = emax * ratio_pow / (1.0 + ratio_pow + 1e-12)        # [B,S,H], in (0, emax]
+        return w
 
 class StateTransitionPerturbationModel(PerturbationModel):
     """
@@ -296,11 +318,52 @@ class StateTransitionPerturbationModel(PerturbationModel):
             self.confidence_weight = 0.0
 
         self.use_dosage_encoder = bool(kwargs.get("dosage", False))
-        if self.use_dosage_encoder:
-            self.dosage_encoder = nn.Linear(1, self.hidden_dim)
+        # Feature flag: pharmacologically-informed dose handling
+        self.use_hill_prior = bool(kwargs.get("hill_prior", False))
+        if self.use_hill_prior:
+            # Running stats for standardized log10-dose
+            self.register_buffer("dose_mean", torch.tensor(0.0))
+            self.register_buffer("dose_std", torch.tensor(1.0))
+            self.dose_momentum = float(kwargs.get("dose_momentum", 0.01))
+            # Strength of FiLM modulation
+            self.dose_strength = nn.Parameter(torch.tensor(float(kwargs.get("dose_strength_init", 1.0))))
+            # FiLM network on standardized log10-dose
+            self.dose_film = nn.Sequential(
+                nn.Linear(1, 128),
+                nn.SiLU(),
+                nn.Linear(128, 2 * self.hidden_dim),
+            )
+            # Hill/Emax gate on residual
+            self.hill_gate = HillGate(self.hidden_dim)
+            # Small curvature penalty across doses of the same drug
+            self.dose_smooth_weight = float(kwargs.get("dose_smooth_weight", 0.01))
         else:
-            self.dosage_encoder = None
-        self._warned_missing_dosage = False
+            self.dose_smooth_weight = 0.0
+
+        # Dose conditioning
+        logd_norm = None  # keep to apply Hill gate after the transformer
+        if self.use_dosage_encoder:
+            dosage_tensor = self._prepare_dosage_tensor(batch, seq_input.device, pert.shape[:2])
+            if dosage_tensor is not None:
+                if self.use_hill_prior:
+                    # log10 and standardize with running stats
+                    logd = torch.log10(dosage_tensor.clamp_min(1e-9))  # [B,S,1]
+                    if self.training:
+                        with torch.no_grad():
+                            bmean = logd.mean()
+                            bstd = logd.std(unbiased=False).clamp_min(1e-6)
+                            self.dose_mean = (1 - self.dose_momentum) * self.dose_mean + self.dose_momentum * bmean
+                            self.dose_std  = (1 - self.dose_momentum) * self.dose_std  + self.dose_momentum * bstd
+                    logd_norm = (logd - self.dose_mean) / (self.dose_std + 1e-6)
+                    # FiLM modulation: seq_input <- (1 + α*(γ-1))*x + α*β
+                    film_params = self.dose_film(logd_norm)            # [B,S,2H]
+                    gamma, beta = film_params.chunk(2, dim=-1)
+                    gamma = F.softplus(gamma)                          # positive scale
+                    seq_input = (1 + self.dose_strength * (gamma - 1)) * seq_input + self.dose_strength * beta
+                else:
+                    # Legacy additive dose features
+                    dosage_features = self.dosage_encoder(torch.log1p(dosage_tensor))
+                    seq_input = seq_input + dosage_features
 
         # Backward-compat: accept legacy key `freeze_pert`
         self.freeze_pert_backbone = kwargs.get("freeze_pert_backbone", kwargs.get("freeze_pert", False))
@@ -518,6 +581,9 @@ class StateTransitionPerturbationModel(PerturbationModel):
             res_pred = transformer_output
             self._batch_token_cache = None
 
+        # Apply a monotone, saturating gate on the residual if enabled
+        if self.use_hill_prior and logd_norm is not None:
+            res_pred = res_pred * self.hill_gate(logd_norm)            # [B,S,H]×[B,S,H]
         # Cache token features for auxiliary batch prediction loss (B, S, H)
         self._token_features = res_pred
 
