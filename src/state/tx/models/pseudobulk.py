@@ -371,8 +371,8 @@ class PseudobulkPerturbationModel(PerturbationModel):
         target = batch["pert_cell_emb"]
         target = target.reshape(-1, self.cell_sentence_len, self.output_dim)
 
-        loss = self.loss_fn(pred, target).mean()
-        self.log("val_loss", loss)
+        loss = torch.nanmean(self.loss_fn(pred, target))
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
         if self.gene_decoder is not None and "pert_cell_counts" in batch:
             gene_targets = batch["pert_cell_counts"]
