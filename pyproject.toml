@@ -32,9 +32,9 @@ dependencies = [
     "scipy>=1.15.0",
 ]
 
-[tool.uv.sources]
-cell-load = {path = "/home/aadduri/cell-load"}
-cell-eval = {git = "https://github.com/ArcInstitute/cell-eval", branch = "aadduri/aupr_curves"}
+# [tool.uv.sources]
+# cell-load = {path = "/home/aadduri/cell-load"}
+# cell-eval = {git = "https://github.com/ArcInstitute/cell-eval"}
 
 [project.optional-dependencies]
 vectordb = [
