@@ -1,4 +1,3 @@
-import ast
 import logging
 import math
 
@@ -96,29 +95,6 @@ class ConfidenceToken(nn.Module):
         confidence_pred = self.confidence_projection(confidence_output).squeeze(-1)  # [B, 1]
 
         return main_output, confidence_pred
-
-class HillGate(nn.Module):
-    """
-    Monotone, saturating gate w(d) for dose d that multiplies the residual.
-    For each hidden unit h:
-        w_h(d) = softplus(Emax_h) * (d/EC50_h)^{n_h} / (1 + (d/EC50_h)^{n_h})
-    The forward expects log10-dose with shape [B,S,1] (standardized is fine).
-    """
-    def __init__(self, hidden_dim: int):
-        super().__init__()
-        self.log_ec50 = nn.Parameter(torch.zeros(hidden_dim))   # EC50 = exp(log_ec50) > 0
-        self.emax     = nn.Parameter(torch.ones(hidden_dim))     # softplus(emax) > 0
-        self.hill     = nn.Parameter(torch.ones(hidden_dim))     # softplus(hill) > 0
-
-    def forward(self, log10_d: torch.Tensor) -> torch.Tensor:
-        # Convert log10-dose to linear space and broadcast to hidden dim
-        d = (10.0 ** log10_d).clamp_min(1e-12)                  # [B,S,1]
-        n    = F.softplus(self.hill).view(1, 1, -1)             # [1,1,H]
-        emax = F.softplus(self.emax).view(1, 1, -1)             # [1,1,H]
-        ec50 = self.log_ec50.exp().view(1, 1, -1)               # [1,1,H]
-        ratio_pow = (d / ec50).pow(n)                           # [B,S,H]
-        w = emax * ratio_pow / (1.0 + ratio_pow + 1e-12)        # [B,S,H], in (0, emax]
-        return w
 
 class StateTransitionPerturbationModel(PerturbationModel):
     """
@@ -317,31 +293,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
             self.confidence_target_scale = None
             self.confidence_weight = 0.0
 
-        self.use_dosage_encoder = bool(kwargs.get("dosage", False))
-        self.dosage_encoder = nn.Linear(1, self.hidden_dim) if self.use_dosage_encoder else None
-        self._warned_missing_dosage = False
-        # Feature flag: pharmacologically-informed dose handling
-        self.use_hill_prior = bool(kwargs.get("hill_prior", False))
-        if self.use_hill_prior:
-            # Running stats for standardized log10-dose
-            self.register_buffer("dose_mean", torch.tensor(0.0))
-            self.register_buffer("dose_std", torch.tensor(1.0))
-            self.dose_momentum = float(kwargs.get("dose_momentum", 0.01))
-            # Strength of FiLM modulation
-            self.dose_strength = nn.Parameter(torch.tensor(float(kwargs.get("dose_strength_init", 1.0))))
-            # FiLM network on standardized log10-dose
-            self.dose_film = nn.Sequential(
-                nn.Linear(1, 128),
-                nn.SiLU(),
-                nn.Linear(128, 2 * self.hidden_dim),
-            )
-            # Hill/Emax gate on residual
-            self.hill_gate = HillGate(self.hidden_dim)
-            # Small curvature penalty across doses of the same drug
-            self.dose_smooth_weight = float(kwargs.get("dose_smooth_weight", 0.01))
-        else:
-            self.dose_smooth_weight = 0.0
-
         # Backward-compat: accept legacy key `freeze_pert`
         self.freeze_pert_backbone = kwargs.get("freeze_pert_backbone", kwargs.get("freeze_pert", False))
         if self.freeze_pert_backbone:
@@ -479,27 +430,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
         combined_input = pert_embedding + control_cells  # Shape: [B, S, hidden_dim]
         seq_input = combined_input  # Shape: [B, S, hidden_dim]
 
-        logd_norm: Optional[torch.Tensor] = None
-        if self.use_dosage_encoder:
-            dosage_tensor = self._prepare_dosage_tensor(batch, seq_input.device, pert.shape[:2])
-            if dosage_tensor is not None:
-                if self.use_hill_prior:
-                    logd = torch.log10(dosage_tensor.clamp_min(1e-9))  # [B,S,1]
-                    if self.training:
-                        with torch.no_grad():
-                            bmean = logd.mean()
-                            bstd = logd.std(unbiased=False).clamp_min(1e-6)
-                            self.dose_mean = (1 - self.dose_momentum) * self.dose_mean + self.dose_momentum * bmean
-                            self.dose_std = (1 - self.dose_momentum) * self.dose_std + self.dose_momentum * bstd
-                    logd_norm = (logd - self.dose_mean) / (self.dose_std + 1e-6)
-                    film_params = self.dose_film(logd_norm)
-                    gamma, beta = film_params.chunk(2, dim=-1)
-                    gamma = F.softplus(gamma)
-                    seq_input = (1 + self.dose_strength * (gamma - 1)) * seq_input + self.dose_strength * beta
-                elif self.dosage_encoder is not None:
-                    dosage_features = self.dosage_encoder(torch.log1p(dosage_tensor))
-                    seq_input = seq_input + dosage_features
-
         if self.batch_encoder is not None:
             # Extract batch indices (assume they are integers or convert from one-hot)
             batch_indices = batch["batch"]
@@ -573,9 +503,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
             res_pred = transformer_output
             self._batch_token_cache = None
 
-        # Apply a monotone, saturating gate on the residual if enabled
-        if self.use_hill_prior and logd_norm is not None:
-            res_pred = res_pred * self.hill_gate(logd_norm)            # [B,S,H]×[B,S,H]
         # Cache token features for auxiliary batch prediction loss (B, S, H)
         self._token_features = res_pred
 
@@ -602,161 +529,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
             return output, confidence_pred
         else:
             return output
-
-    def _prepare_dosage_tensor(
-        self, batch: Dict[str, torch.Tensor], device: torch.device, shape: Tuple[int, int]
-    ) -> Optional[torch.Tensor]:
-        """Return dosage tensor shaped for broadcasting or None if unavailable."""
-
-        if not self.use_dosage_encoder:
-            return None
-
-        dosage_values = batch.get("pert_dosage")
-
-        if dosage_values is not None:
-            if torch.is_tensor(dosage_values):
-                dosage_tensor = dosage_values.to(device=device, dtype=torch.float32)
-            else:
-                dosage_tensor = torch.as_tensor(dosage_values, device=device, dtype=torch.float32)
-        else:
-            pert_names = batch.get("pert_name")
-            if pert_names is None:
-                if not self._warned_missing_dosage:
-                    logger.warning(
-                        "Dosage encoder enabled but no dosage information found in batch; skipping dosage term."
-                    )
-                    self._warned_missing_dosage = True
-                return None
-
-            if isinstance(pert_names, torch.Tensor):
-                pert_names = pert_names.tolist()
-            if not isinstance(pert_names, (list, tuple)):
-                pert_names = [pert_names]
-
-            dosage_list = [self._parse_dosage_from_name(name) for name in pert_names]
-            dosage_tensor = torch.tensor(dosage_list, device=device, dtype=torch.float32)
-
-            if not self._warned_missing_dosage:
-                logger.warning(
-                    "Falling back to parsing dosage from perturbation names; consider providing 'pert_dosage'."
-                )
-                self._warned_missing_dosage = True
-
-        dosage_tensor = dosage_tensor.flatten()
-        expected_elems = shape[0] * shape[1]
-
-        if dosage_tensor.numel() == expected_elems:
-            return dosage_tensor.reshape(shape[0], shape[1], 1)
-
-        if dosage_tensor.numel() == shape[0] and shape[1] > 0:
-            return dosage_tensor.view(shape[0], 1, 1).expand(shape[0], shape[1], 1)
-
-        if shape[0] == 1 and dosage_tensor.numel() == shape[1]:
-            return dosage_tensor.view(1, shape[1], 1)
-
-        logger.warning(
-            "Dosage tensor has %d elements but expected either %d or %d; skipping dosage term for this batch.",
-            dosage_tensor.numel(),
-            expected_elems,
-            shape[0],
-        )
-        return None
-
-    @staticmethod
-    def _parse_dosage_from_name(name: Optional[str]) -> float:
-        """Extract dosage value from perturbation name string."""
-
-        if not isinstance(name, str):
-            return 0.0
-
-        try:
-            parsed = ast.literal_eval(name)
-        except (ValueError, SyntaxError):
-            return 0.0
-
-        try:
-            if isinstance(parsed, (list, tuple)) and len(parsed) > 0:
-                first_entry = parsed[0]
-                if isinstance(first_entry, (list, tuple)) and len(first_entry) > 1:
-                    return float(first_entry[1])
-        except (TypeError, ValueError):
-            pass
-
-        return 0.0
-
-    @staticmethod
-    def _parse_drug_from_name(name: Optional[str]) -> str:
-        """Best-effort extraction of the base drug identifier from a perturbation name."""
-        if not isinstance(name, str):
-            return "unknown"
-        try:
-            parsed = ast.literal_eval(name)
-            if isinstance(parsed, (list, tuple)) and len(parsed) > 0:
-                first_entry = parsed[0]
-                if isinstance(first_entry, (list, tuple)) and len(first_entry) > 0:
-                    return str(first_entry[0])
-        except (ValueError, SyntaxError):
-            pass
-        # Fallback: strip common separators if present
-        return name.split("@")[0].split("|")[0]
-
-    def _dose_smoothness_loss(self, batch: Dict[str, torch.Tensor], pred: torch.Tensor, padded: bool) -> torch.Tensor:
-        """
-        Encourage a smooth (low curvature) trajectory across log-dose for the same drug within the minibatch.
-        'pred' is [B,S,D] (set of cells per dose). We reduce over S (cells) first.
-       Requires 'pert_dosage' (or parseable names) to be present; otherwise returns 0.
-        """
-        if not self.use_hill_prior or self.dose_smooth_weight <= 0.0:
-            return pred.new_tensor(0.0)
-
-        B, S, D = pred.shape
-        device = pred.device
-
-        # One dose per sentence
-        dose = self._prepare_dosage_tensor(batch, device, (B, S))
-        if dose is None:
-            return pred.new_tensor(0.0)
-        dose_per_sentence = dose[:, 0, 0]  # [B]
-
-        # One drug label per sentence (best effort)
-        groups = None
-        names = batch.get("pert_name", None)
-        if names is not None:
-            if isinstance(names, torch.Tensor):
-                names_list = names.reshape(-1).tolist()
-            else:
-                names_list = list(names)
-            if len(names_list) >= B * S:
-                per_sentence = [names_list[i * S] for i in range(B)]
-            elif len(names_list) >= B:
-                per_sentence = [names_list[i] for i in range(B)]
-            else:
-                per_sentence = None
-            if per_sentence is not None:
-                groups = [self._parse_drug_from_name(n) for n in per_sentence]
-        if groups is None:
-            groups = ["__all__"] * B  # fall back to one pooled group
-
-        # Reduce each sentence to a set-level vector
-        set_pred = pred.mean(dim=1)  # [B, D]
-
-        buckets: Dict[str, list] = {}
-        for i, g in enumerate(groups):
-            buckets.setdefault(g, []).append((dose_per_sentence[i].item(), i))
-
-        losses = []
-        for _, lst in buckets.items():
-            if len(lst) < 3:
-                continue
-            lst.sort(key=lambda x: x[0])         # ascending dose
-            idx = [i for _, i in lst]
-            series = set_pred[idx]               # [Nd, D]
-            second = series[2:] - 2 * series[1:-1] + series[:-2]
-            losses.append((second ** 2).mean())
-
-        if not losses:
-            return pred.new_tensor(0.0)
-        return torch.stack(losses).mean()
 
     def _compute_distribution_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Apply the primary distributional loss, optionally chunking feature dimensions for SamplesLoss."""
@@ -920,12 +692,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
             # Add regularization to total loss
             total_loss = total_loss + self.regularization * l1_loss
 
-        if self.use_hill_prior and self.dose_smooth_weight > 0.0:
-            with torch.no_grad() if not self.training else torch.enable_grad():
-                smooth_loss = self._dose_smoothness_loss(batch, pred, padded=padded)
-            self.log("train/dose_smooth_loss", smooth_loss)
-            total_loss = total_loss + self.dose_smooth_weight * smooth_loss
-
         return total_loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
@@ -986,12 +752,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
             confidence_loss = self.confidence_weight * self.confidence_loss_fn(confidence_pred_vals, confidence_targets)
             self.log("val/confidence_loss", confidence_loss)
             self.log("val/actual_loss", confidence_targets.mean())
-
-        # Validation analogue of curvature penalty
-        if self.use_hill_prior and self.dose_smooth_weight > 0.0:
-            smooth_loss = self._dose_smoothness_loss(batch, pred, padded=True)
-            self.log("val/dose_smooth_loss", smooth_loss)
-            loss = loss + self.dose_smooth_weight * smooth_loss
 
         return {"loss": loss, "predictions": pred}
 

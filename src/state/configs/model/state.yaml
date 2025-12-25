@@ -21,13 +21,6 @@ kwargs:
   nb_decoder: False
   mask_attn: False
 
-  # --- Dose handling ---
-  dosage: False
-  hill_prior:  False
-  dose_momentum: 0.01    # NEW: EMA for log10-dose mean/std
-  dose_strength_init: 1.0  # NEW: initial strength of FiLM modulation
-  dose_smooth_weight: 0.01 # NEW: curvature penalty across doses
-
   use_effect_gating_token: False
   distributional_loss: energy
   init_from: null
